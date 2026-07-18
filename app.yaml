@@ -1,0 +1,10 @@
+id: vision
+name: 测试
+version: 1.0.0
+author: MILU
+icon: app.png
+desc: 5t第一次测试
+files:
+  - app.png
+  - app.yaml
+  - main.py

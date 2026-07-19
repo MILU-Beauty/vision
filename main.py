@@ -1,24 +1,13 @@
-from maix import camera, image, display, time, touchscreen
+from maix import camera, image, display, time, touchscreen, uart, pinmap
 import math
-
-# Workflow.
-# Use "a4_tape" for the black-tape rectangle task.
-WORKFLOW = "a4_tape"  # "screen_reset" or "a4_tape"
 
 # Camera profiles.
 # Switch this line first when the venue light changes.
-if WORKFLOW == "a4_tape":
-    CAMERA_PROFILE = "a4_normal"
-else:
-    CAMERA_PROFILE = "laser_dark"
-
+PROFILE = "laser_dark"  # "laser_dark", "laser_normal", "laser_bright", or "paper"
 CAMERA_PROFILES = {
     "laser_dark": {"exposure": 2600, "gain": 65},
     "laser_normal": {"exposure": 1300, "gain": 65},
     "laser_bright": {"exposure": 700, "gain": 50},
-    "a4_dark": {"exposure": 6500, "gain": 80},
-    "a4_normal": {"exposure": 3600, "gain": 70},
-    "a4_bright": {"exposure": 1800, "gain": 55},
     "paper": {"exposure": 1200, "gain": 80},
 }
 
@@ -40,57 +29,16 @@ RED_LAB_THRESHOLDS = {
     "laser_dark": (8, 255, 18, 127, -45, 95),
     "laser_normal": (15, 255, 18, 127, -40, 90),
     "laser_bright": (30, 255, 25, 127, -30, 80),
-    "a4_dark": (4, 255, 10, 127, -55, 105),
-    "a4_normal": (12, 255, 18, 127, -45, 95),
-    "a4_bright": (20, 255, 25, 127, -35, 85),
 }
-if WORKFLOW == "a4_tape":
-    RED_PROFILE = CAMERA_PROFILE
-else:
-    RED_PROFILE = "laser_dark"
-RED_LAB_THRESH = RED_LAB_THRESHOLDS.get(RED_PROFILE, RED_LAB_THRESHOLDS["laser_normal"])
-MIN_SPOT_AREA = 3
+RED_LAB_THRESH = RED_LAB_THRESHOLDS.get(PROFILE, RED_LAB_THRESHOLDS["laser_normal"])
+MIN_SPOT_AREA = 5
 MAX_SPOT_AREA = 2500
-MAX_SPOT_WIDTH = 60
-MAX_SPOT_HEIGHT = 60
+MAX_SPOT_WIDTH = 45
+MAX_SPOT_HEIGHT = 45
 SHAPE_CHECK_AREA = 150
 MIN_FILL_RATIO = 0.55
 MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 2.8
-
-# A4 black tape detection.
-A4_BLACK_THRESHOLDS = {
-    "a4_dark": (0, 75, -35, 35, -35, 35),
-    "a4_normal": (0, 58, -28, 28, -28, 28),
-    "a4_bright": (0, 48, -24, 24, -24, 24),
-}
-A4_BLACK_THRESH = A4_BLACK_THRESHOLDS.get(CAMERA_PROFILE, A4_BLACK_THRESHOLDS["a4_normal"])
-A4_BLACK_MIN_AREA = 220
-A4_BLACK_MAX_AREA = 45000
-A4_ASPECT_PORTRAIT = 21.0 / 29.7
-A4_ASPECT_LANDSCAPE = 29.7 / 21.0
-A4_ASPECT_TOL = 0.30
-A4_FILL_MIN = 0.05
-A4_FILL_MAX = 0.50
-A4_TAPE_WIDTH_CM = 1.8
-A4_TAPE_TOL_CM = 0.5
-A4_FAIL_OFF_CM = 5.0
-A4_MIN_RECT_AREA = 2600
-A4_MAX_RECT_AREA_RATIO = 0.70
-A4_MIN_EDGE_PX = 32
-A4_MIN_ASPECT_SCORE = 0.50
-A4_MIN_RECT_FILL = 0.04
-A4_MAX_RECT_FILL = 0.60
-A4_DETECT_EVERY_FRAMES = 3
-A4_HOLD_FRAMES = 24
-A4_PACKET_EVERY_MS = 300
-A4_DIR_MIN_PROGRESS = 0.004
-A4_RECT_THRESHOLD = 3500
-A4_DEBUG = True
-A4_SEARCH_ROIS = [
-    (0.06, 0.04, 0.74, 0.82),
-    (0.12, 0.08, 0.64, 0.74),
-]
 
 # Calibration workflow.
 MODE = "calibrate"  # "calibrate" or "track"
@@ -104,6 +52,16 @@ CALIB_STEPS = [
 ]
 TOUCH_HINT = "Tap screen to confirm current point"
 
+# UART link to motor controller.
+# MaixCam Pro recommended UART1: A19(TX) -> controller RX, A18(RX) <- controller TX, common GND.
+UART_ENABLED = True
+UART_PORT = "/dev/ttyS1"
+UART_BAUD = 115200
+UART_TX_PIN = "A19"
+UART_RX_PIN = "A18"
+LIVE_POINT_ID = 5
+LIVE_SEND_INTERVAL_MS = 80
+
 CALIB_EXPECTED_PIXEL = {
     "TL": (IMG_W * 0.25, IMG_H * 0.25),
     "TR": (IMG_W * 0.75, IMG_H * 0.25),
@@ -114,11 +72,16 @@ CALIB_EXPECTED_PIXEL = {
 
 # Runtime state.
 cam = camera.Camera(IMG_W, IMG_H)
-profile = CAMERA_PROFILES.get(CAMERA_PROFILE, CAMERA_PROFILES["laser_normal"])
+profile = CAMERA_PROFILES.get(PROFILE, CAMERA_PROFILES["laser_normal"])
 cam.exposure(profile["exposure"])
 cam.gain(profile["gain"])
 disp = display.Display()
 ts = touchscreen.TouchScreen()
+serial = None
+uart_rx_buf = ""
+uart_status = "UART OFF"
+last_live_send_ms = 0
+pending_reset_request = False
 try:
     DISP_W = disp.width()
     DISP_H = disp.height()
@@ -139,23 +102,6 @@ H_MATRIX = None
 calib_points = {}
 calib_index = 0
 
-a4_frame_index = 0
-a4_target = None
-a4_target_age = A4_HOLD_FRAMES + 1
-a4_run_active = False
-a4_run_start_ms = 0
-a4_lap_progress = 0.0
-a4_last_progress = None
-a4_last_spot = None
-a4_off_move_cm = 0.0
-a4_result_msg = "READY"
-a4_last_packet_ms = 0
-a4_dbg_blobs = 0
-a4_dbg_blob_pass = 0
-a4_dbg_rects = 0
-a4_dbg_reason = "INIT"
-a4_dbg_black_boxes = []
-
 
 def distance_cm(x1, y1, x2, y2):
     dx = x1 - x2
@@ -163,146 +109,73 @@ def distance_cm(x1, y1, x2, y2):
     return math.sqrt(dx * dx + dy * dy)
 
 
-def point_distance_px(p1, p2):
-    dx = p1[0] - p2[0]
-    dy = p1[1] - p2[1]
-    return math.sqrt(dx * dx + dy * dy)
+def init_uart_link():
+    global serial, uart_status
+    if not UART_ENABLED:
+        uart_status = "UART DISABLED"
+        return False
+
+    try:
+        pinmap.set_pin_function(UART_TX_PIN, "UART1_TX")
+        pinmap.set_pin_function(UART_RX_PIN, "UART1_RX")
+    except:
+        pass
+
+    try:
+        serial = uart.UART(UART_PORT, UART_BAUD)
+        uart_status = "UART {} {}".format(UART_PORT, UART_BAUD)
+        return True
+    except:
+        serial = None
+        uart_status = "UART FAIL"
+        return False
 
 
-def polygon_area(points):
-    if points is None or len(points) < 3:
-        return 0.0
-    s = 0.0
-    last = len(points) - 1
-    for i in range(len(points)):
-        x1, y1 = points[last]
-        x2, y2 = points[i]
-        s += x1 * y2 - x2 * y1
-        last = i
-    return abs(s) * 0.5
+def uart_send_line(text):
+    global serial
+    line = "{}\n".format(text)
+    print(line.strip())
+    if serial is None:
+        return False
+    try:
+        if hasattr(serial, "write_str"):
+            serial.write_str(line)
+        else:
+            serial.write(line.encode())
+        return True
+    except:
+        return False
 
 
-def order_rect_corners(points):
-    if points is None or len(points) < 4:
-        return None
-
-    pts = [(float(p[0]), float(p[1])) for p in points[:4]]
-    cx = sum(p[0] for p in pts) / 4.0
-    cy = sum(p[1] for p in pts) / 4.0
-    pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-
-    min_idx = 0
-    min_sum = pts[0][0] + pts[0][1]
-    for i in range(1, 4):
-        s = pts[i][0] + pts[i][1]
-        if s < min_sum:
-            min_sum = s
-            min_idx = i
-    pts = pts[min_idx:] + pts[:min_idx]
-
-    # Image coordinates grow downward; this order is clockwise on the screen.
-    if signed_polygon_area(pts) < 0:
-        pts = [pts[0], pts[3], pts[2], pts[1]]
-    return pts
+def uart_send_point(idx, x, y):
+    return uart_send_line("({},{},{})".format(int(idx), int(x), int(y)))
 
 
-def signed_polygon_area(points):
-    s = 0.0
-    last = len(points) - 1
-    for i in range(len(points)):
-        x1, y1 = points[last]
-        x2, y2 = points[i]
-        s += x1 * y2 - x2 * y1
-        last = i
-    return s * 0.5
-
-
-def point_in_convex_quad(px, py, quad):
-    sign = 0
-    for i in range(4):
-        x1, y1 = quad[i]
-        x2, y2 = quad[(i + 1) % 4]
-        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-        if abs(cross) < 1e-6:
+def uart_poll_command():
+    global uart_rx_buf, pending_reset_request
+    if serial is None:
+        return
+    try:
+        data = serial.read()
+    except:
+        return
+    if not data:
+        return
+    try:
+        if isinstance(data, bytes):
+            chunk = data.decode("utf-8", "ignore")
+        else:
+            chunk = str(data)
+    except:
+        return
+    uart_rx_buf += chunk
+    while "\n" in uart_rx_buf:
+        line, uart_rx_buf = uart_rx_buf.split("\n", 1)
+        cmd = line.strip().upper()
+        if not cmd:
             continue
-        now_sign = 1 if cross > 0 else -1
-        if sign == 0:
-            sign = now_sign
-        elif sign != now_sign:
-            return False
-    return True
-
-
-def point_segment_distance_px(px, py, ax, ay, bx, by):
-    vx = bx - ax
-    vy = by - ay
-    wx = px - ax
-    wy = py - ay
-    denom = vx * vx + vy * vy
-    if denom <= 1e-6:
-        return point_distance_px((px, py), (ax, ay)), 0.0
-    t = (wx * vx + wy * vy) / denom
-    if t < 0.0:
-        t = 0.0
-    elif t > 1.0:
-        t = 1.0
-    qx = ax + t * vx
-    qy = ay + t * vy
-    return point_distance_px((px, py), (qx, qy)), t
-
-
-def rect_edge_lengths(rect):
-    if rect is None:
-        return None
-    return [point_distance_px(rect[i], rect[(i + 1) % 4]) for i in range(4)]
-
-
-def cm_per_px_from_rect(rect):
-    lengths = rect_edge_lengths(rect)
-    if lengths is None:
-        return CM_PER_PIXEL_FALLBACK
-    short_px = min(lengths)
-    long_px = max(lengths)
-    if short_px <= 1.0 or long_px <= 1.0:
-        return CM_PER_PIXEL_FALLBACK
-
-    cm_a = 21.0 / short_px
-    cm_b = 29.7 / long_px
-    return (cm_a + cm_b) * 0.5
-
-
-def tape_state_for_spot(rect, px, py):
-    if rect is None:
-        return None
-
-    cm_per_px = cm_per_px_from_rect(rect)
-    tape_half_px = (A4_TAPE_WIDTH_CM + A4_TAPE_TOL_CM) / max(cm_per_px, 0.001)
-    inside = point_in_convex_quad(px, py, rect)
-
-    best_dist = 99999.0
-    best_progress = 0.0
-    best_edge = 0
-    total_len = 0.0
-    edge_lens = rect_edge_lengths(rect)
-    if edge_lens is None:
-        return None
-    perimeter = sum(edge_lens)
-    if perimeter <= 1.0:
-        return None
-
-    for i in range(4):
-        ax, ay = rect[i]
-        bx, by = rect[(i + 1) % 4]
-        dist, t = point_segment_distance_px(px, py, ax, ay, bx, by)
-        if dist < best_dist:
-            best_dist = dist
-            best_progress = (total_len + edge_lens[i] * t) / perimeter
-            best_edge = i
-        total_len += edge_lens[i]
-
-    dist_cm = best_dist * cm_per_px
-    on_tape = inside and best_dist <= tape_half_px
-    return on_tape, dist_cm, best_progress, best_edge, cm_per_px
+        if cmd in ("R", "RESET", "START"):
+            pending_reset_request = True
 
 
 def solve_linear_system(a, b):
@@ -400,29 +273,6 @@ def get_valid_spot_blobs(blobs):
     return result
 
 
-def point_inside_any_roi(px, py, rois):
-    for roi in rois:
-        rx, ry, rw, rh = roi
-        x1 = rx * IMG_W
-        y1 = ry * IMG_H
-        x2 = (rx + rw) * IMG_W
-        y2 = (ry + rh) * IMG_H
-        if px >= x1 and px <= x2 and py >= y1 and py <= y2:
-            return True
-    return False
-
-
-def filter_blobs_in_rois(blobs, rois):
-    result = []
-    for b in blobs:
-        try:
-            if point_inside_any_roi(float(b.cx()), float(b.cy()), rois):
-                result.append(b)
-        except:
-            pass
-    return result
-
-
 def select_target_blob(candidates, step_label=None):
     best_blob = None
     best_score = -999999.0
@@ -444,434 +294,6 @@ def select_target_blob(candidates, step_label=None):
             best_score = score
             best_blob = b
     return best_blob
-
-
-def detect_red_spot(img, step_label=None):
-    blobs = img.find_blobs(
-        [RED_LAB_THRESH],
-        pixels_threshold=MIN_SPOT_AREA,
-        area_threshold=MIN_SPOT_AREA,
-        merge=True
-    )
-    candidates = get_valid_spot_blobs(blobs)
-    if WORKFLOW == "a4_tape":
-        candidates = filter_blobs_in_rois(candidates, A4_SEARCH_ROIS)
-    return select_target_blob(candidates, step_label), candidates
-
-
-def select_red_blob_for_a4(candidates, rect):
-    if not candidates:
-        return None
-
-    best_blob = None
-    best_score = -999999.0
-    buffer_px = 24
-    for b in candidates:
-        score = b.area()
-        if rect is not None:
-            inside = point_in_convex_quad(b.cx(), b.cy(), rect)
-            if inside:
-                score += 5000.0
-            else:
-                best_dist = 999999.0
-                for i in range(4):
-                    ax, ay = rect[i]
-                    bx, by = rect[(i + 1) % 4]
-                    dist, _ = point_segment_distance_px(b.cx(), b.cy(), ax, ay, bx, by)
-                    if dist < best_dist:
-                        best_dist = dist
-                if best_dist > buffer_px:
-                    continue
-                score += (buffer_px - best_dist) * 20.0
-        if score > best_score:
-            best_score = score
-            best_blob = b
-    return best_blob
-
-
-def blob_pixel_count(b):
-    try:
-        return b.pixels()
-    except:
-        return b.area()
-
-
-def normalize_corner_points(raw_points):
-    points = []
-    for p in raw_points:
-        try:
-            points.append((float(p[0]), float(p[1])))
-            continue
-        except:
-            pass
-        try:
-            points.append((float(p.x()), float(p.y())))
-        except:
-            pass
-    if len(points) < 4:
-        return None
-    return points[:4]
-
-
-def blob_rect_corners(b):
-    for method_name in ("mini_corners", "min_corners", "corners"):
-        try:
-            method = getattr(b, method_name)
-            points = normalize_corner_points(method())
-            if points is not None:
-                ordered = order_rect_corners(points)
-                if ordered is not None:
-                    return ordered
-        except:
-            pass
-
-    return order_rect_corners([
-        (b.x(), b.y()),
-        (b.x() + b.w(), b.y()),
-        (b.x() + b.w(), b.y() + b.h()),
-        (b.x(), b.y() + b.h()),
-    ])
-
-
-def score_a4_blob(b):
-    global a4_dbg_reason
-
-    pixels = blob_pixel_count(b)
-    if pixels < A4_BLACK_MIN_AREA or pixels > A4_BLACK_MAX_AREA:
-        a4_dbg_reason = "area {}".format(pixels)
-        return None
-
-    rect = blob_rect_corners(b)
-    if rect is None:
-        a4_dbg_reason = "corner"
-        return None
-
-    rect_area = polygon_area(rect)
-    if rect_area < A4_MIN_RECT_AREA:
-        a4_dbg_reason = "rect {:.0f}".format(rect_area)
-        return None
-    if rect_area > IMG_W * IMG_H * A4_MAX_RECT_AREA_RATIO:
-        a4_dbg_reason = "big {:.0f}".format(rect_area)
-        return None
-
-    lengths = rect_edge_lengths(rect)
-    if lengths is None:
-        a4_dbg_reason = "length"
-        return None
-
-    short_px = min(lengths)
-    long_px = max(lengths)
-    if short_px < A4_MIN_EDGE_PX or long_px <= 1.0:
-        a4_dbg_reason = "edge {:.0f}".format(short_px)
-        return None
-
-    aspect = short_px / long_px
-    if abs(aspect - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
-        a4_dbg_reason = "aspect {:.2f}".format(aspect)
-        return None
-
-    fill = pixels / rect_area
-    if fill < A4_FILL_MIN or fill > A4_FILL_MAX:
-        a4_dbg_reason = "fill {:.2f}".format(fill)
-        return None
-
-    aspect_score = max(0.0, 1.0 - abs(aspect - A4_ASPECT_PORTRAIT) * 2.5)
-    fill_score = max(0.0, 1.0 - abs(fill - 0.27) * 3.0)
-    size_score = min(rect_area, 18000.0) / 18000.0
-    score = aspect_score * 120.0 + fill_score * 80.0 + size_score * 40.0
-
-    return {
-        "rect": rect,
-        "score": score,
-        "pixels": pixels,
-        "area": rect_area,
-        "fill": fill,
-        "aspect": aspect,
-        "cm_per_px": cm_per_px_from_rect(rect),
-        "source": "blob",
-    }
-
-
-def detect_a4_target(img):
-    global a4_dbg_blobs, a4_dbg_blob_pass, a4_dbg_rects, a4_dbg_reason
-
-    a4_dbg_blobs = 0
-    a4_dbg_blob_pass = 0
-    a4_dbg_rects = 0
-    a4_dbg_reason = "none"
-
-    blobs = find_a4_black_candidates(img)
-
-    a4_dbg_blobs = len(blobs)
-
-    best = None
-    best_score = -999999.0
-    for b in blobs:
-        candidate = score_a4_blob(b)
-        if candidate is None:
-            continue
-        a4_dbg_blob_pass += 1
-        if candidate["score"] > best_score:
-            best_score = candidate["score"]
-            best = candidate
-
-    rect_best = detect_a4_rect_target(img)
-    if rect_best is not None:
-        if best is None or rect_best["score"] > best["score"]:
-            best = rect_best
-
-    if best is not None:
-        a4_dbg_reason = best["source"]
-    return best
-
-
-def rect_corners_from_obj(r):
-    for method_name in ("corners", "rect_corners", "mini_corners"):
-        try:
-            method = getattr(r, method_name)
-            points = normalize_corner_points(method())
-            if points is not None:
-                return order_rect_corners(points)
-        except:
-            pass
-
-    try:
-        return order_rect_corners([
-            (r.x(), r.y()),
-            (r.x() + r.w(), r.y()),
-            (r.x() + r.w(), r.y() + r.h()),
-            (r.x(), r.y() + r.h()),
-        ])
-    except:
-        return None
-
-
-def score_a4_rect(rect):
-    if rect is None:
-        return None
-
-    rect_area = polygon_area(rect)
-    if rect_area < A4_MIN_RECT_AREA:
-        return None
-    if rect_area > IMG_W * IMG_H * A4_MAX_RECT_AREA_RATIO:
-        return None
-
-    lengths = rect_edge_lengths(rect)
-    if lengths is None:
-        return None
-
-    short_px = min(lengths)
-    long_px = max(lengths)
-    if short_px < A4_MIN_EDGE_PX or long_px <= 1.0:
-        return None
-
-    aspect = short_px / long_px
-    if abs(aspect - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
-        return None
-
-    fill_ratio = rect_area / float(IMG_W * IMG_H)
-    if fill_ratio < A4_MIN_RECT_FILL or fill_ratio > A4_MAX_RECT_FILL:
-        return None
-
-    aspect_score = max(0.0, 1.0 - abs(aspect - A4_ASPECT_PORTRAIT) * 2.5)
-    if aspect_score < A4_MIN_ASPECT_SCORE:
-        return None
-
-    size_score = min(rect_area, 18000.0) / 18000.0
-    score = 180.0 + aspect_score * 120.0 + size_score * 40.0
-
-    return {
-        "rect": rect,
-        "score": score,
-        "pixels": 0,
-        "area": rect_area,
-        "fill": 0.0,
-        "aspect": aspect,
-        "cm_per_px": cm_per_px_from_rect(rect),
-        "source": "rect",
-    }
-
-
-def rect_inside_roi(rect, roi):
-    if rect is None:
-        return False
-    rx, ry, rw, rh = roi
-    roi_x1 = rx * IMG_W
-    roi_y1 = ry * IMG_H
-    roi_x2 = (rx + rw) * IMG_W
-    roi_y2 = (ry + rh) * IMG_H
-    cx = 0.0
-    cy = 0.0
-    for x, y in rect:
-        cx += x
-        cy += y
-    cx /= 4.0
-    cy /= 4.0
-    return cx >= roi_x1 and cx <= roi_x2 and cy >= roi_y1 and cy <= roi_y2
-
-
-def blob_inside_any_roi(blob, rois):
-    if blob is None:
-        return False
-    try:
-        cx = float(blob.cx())
-        cy = float(blob.cy())
-    except:
-        try:
-            cx = float(blob.x()) + float(blob.w()) * 0.5
-            cy = float(blob.y()) + float(blob.h()) * 0.5
-        except:
-            return False
-
-    for roi in rois:
-        rx, ry, rw, rh = roi
-        roi_x1 = rx * IMG_W
-        roi_y1 = ry * IMG_H
-        roi_x2 = (rx + rw) * IMG_W
-        roi_y2 = (ry + rh) * IMG_H
-        if cx >= roi_x1 and cx <= roi_x2 and cy >= roi_y1 and cy <= roi_y2:
-            return True
-    return False
-
-
-def draw_blob_box(img, blob, color):
-    if blob is None:
-        return
-    try:
-        x = int(blob.x())
-        y = int(blob.y())
-        w = int(blob.w())
-        h = int(blob.h())
-        img.draw_rect(x, y, w, h, color)
-        img.draw_string(x, max(0, y - 12), "B{}".format(blob.pixels()), color)
-    except:
-        pass
-
-
-def draw_a4_black_debug(img):
-    for x, y, w, h, pixels in a4_dbg_black_boxes:
-        try:
-            img.draw_rect(int(x), int(y), int(w), int(h), image.COLOR_YELLOW)
-            img.draw_string(int(x), max(0, int(y) - 12), "B{}".format(int(pixels)), image.COLOR_YELLOW)
-        except:
-            pass
-
-
-def find_a4_black_candidates(img):
-    global a4_dbg_black_boxes
-
-    a4_dbg_black_boxes = []
-    blobs_all = []
-    seen = set()
-
-    for roi in A4_SEARCH_ROIS:
-        rx, ry, rw, rh = roi
-        roi_x = int(rx * IMG_W)
-        roi_y = int(ry * IMG_H)
-        roi_w = max(1, int(rw * IMG_W))
-        roi_h = max(1, int(rh * IMG_H))
-        try:
-            blobs = img.find_blobs(
-                [A4_BLACK_THRESH],
-                roi=(roi_x, roi_y, roi_w, roi_h),
-                pixels_threshold=A4_BLACK_MIN_AREA,
-                area_threshold=A4_BLACK_MIN_AREA,
-                merge=True
-            )
-        except:
-            blobs = []
-
-        if blobs is None:
-            continue
-
-        for b in blobs:
-            try:
-                key = (int(b.x()), int(b.y()), int(b.w()), int(b.h()))
-                pixels = blob_pixel_count(b)
-            except:
-                continue
-            if key[2] < A4_MIN_EDGE_PX or key[3] < A4_MIN_EDGE_PX:
-                continue
-            area_box = key[2] * key[3]
-            if area_box < A4_MIN_RECT_AREA:
-                continue
-            aspect_box = min(key[2], key[3]) / float(max(key[2], key[3]))
-            if abs(aspect_box - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            blobs_all.append(b)
-            a4_dbg_black_boxes.append((key[0], key[1], key[2], key[3], pixels))
-
-    return blobs_all
-
-
-def detect_a4_rect_target(img):
-    global a4_dbg_rects
-
-    try:
-        rects = img.find_rects(threshold=A4_RECT_THRESHOLD)
-    except:
-        return None
-
-    if rects is None:
-        return None
-
-    a4_dbg_rects = len(rects)
-    best = None
-    best_score = -999999.0
-    for r in rects:
-        rect = rect_corners_from_obj(r)
-        if rect is None:
-            continue
-        for roi in A4_SEARCH_ROIS:
-            if not rect_inside_roi(rect, roi):
-                continue
-            candidate = score_a4_rect(rect)
-            if candidate is None:
-                continue
-            if candidate["score"] > best_score:
-                best_score = candidate["score"]
-                best = candidate
-            break
-    return best
-
-
-def draw_a4_rois(img):
-    for roi in A4_SEARCH_ROIS:
-        x = int(roi[0] * IMG_W)
-        y = int(roi[1] * IMG_H)
-        w = int(roi[2] * IMG_W)
-        h = int(roi[3] * IMG_H)
-        img.draw_rect(x, y, w, h, image.COLOR_BLUE)
-
-
-def draw_rect_lines(img, rect, color):
-    if rect is None:
-        return
-    for i in range(4):
-        x1, y1 = rect[i]
-        x2, y2 = rect[(i + 1) % 4]
-        try:
-            img.draw_line(int(x1), int(y1), int(x2), int(y2), color)
-        except:
-            img.draw_rect(int(x1), int(y1), 2, 2, color)
-
-
-def reset_a4_run(now):
-    global a4_run_active, a4_run_start_ms, a4_lap_progress
-    global a4_last_progress, a4_last_spot, a4_off_move_cm, a4_result_msg
-    global a4_last_packet_ms
-
-    a4_run_active = False
-    a4_run_start_ms = now
-    a4_lap_progress = 0.0
-    a4_last_progress = None
-    a4_last_spot = None
-    a4_off_move_cm = 0.0
-    a4_result_msg = "READY"
-    a4_last_packet_ms = now
 
 
 def load_calibration():
@@ -921,14 +343,21 @@ def save_calibration():
 
 
 def export_calibration_packet():
-    parts = []
-    for label, wx, wy in CALIB_STEPS:
+    lines = []
+    for idx, (label, wx, wy) in enumerate(CALIB_STEPS):
         if label in calib_points:
             px, py, _, _ = calib_points[label]
-            parts.append("{}={:.2f},{:.2f}".format(label, px, py))
+            lines.append("({},{},{})".format(idx, int(round(px)), int(round(py))))
     if H_MATRIX is not None:
-        parts.append("H=" + ",".join("{:.8f}".format(v) for v in H_MATRIX))
-    return "CALIB " + " ".join(parts)
+        lines.append("H=" + ",".join("{:.8f}".format(v) for v in H_MATRIX))
+    return "\n".join(lines)
+
+
+def send_calibration_packet():
+    packet = export_calibration_packet()
+    if packet:
+        for line in packet.split("\n"):
+            uart_send_line(line)
 
 
 def capture_calibration_point(label, wx, wy, px, py):
@@ -944,7 +373,7 @@ def confirm_current_point(raw_x, raw_y):
     label, wx, wy = CALIB_STEPS[calib_index]
     capture_calibration_point(label, wx, wy, raw_x, raw_y)
     save_calibration()
-    print("Captured {}: {:.2f}, {:.2f}".format(label, raw_x, raw_y))
+    print("Captured ({},{},{})".format(calib_index, int(round(raw_x)), int(round(raw_y))))
 
     calib_index += 1
     status_msg = "Saved {}".format(label)
@@ -955,241 +384,141 @@ def confirm_current_point(raw_x, raw_y):
         dst_pts = [(calib_points[label][2], calib_points[label][3]) for label in corner_labels]
         H_MATRIX = compute_homography(src_pts, dst_pts)
         save_calibration()
-        print(export_calibration_packet())
+        send_calibration_packet()
         MODE = "track"
         status_msg = "Calibration done"
 
 
+def send_live_point(raw_x, raw_y, has_spot):
+    if has_spot:
+        x_cm, y_cm = pixel_to_cm(raw_x, raw_y)
+        uart_send_point(LIVE_POINT_ID, int(round(x_cm)), int(round(y_cm)))
+    else:
+        uart_send_point(LIVE_POINT_ID, -1, -1)
+
+
 load_calibration()
-if WORKFLOW == "screen_reset" and MODE == "calibrate":
+if MODE == "calibrate":
     calib_points = {}
     H_MATRIX = None
-elif WORKFLOW == "a4_tape":
-    MODE = "track"
-print("Vision ready, workflow = {}, mode = {}, profile = {}".format(WORKFLOW, MODE, CAMERA_PROFILE))
+init_uart_link()
+print("Vision ready, mode = {}".format(MODE))
 
 while True:
     img = cam.read()
     now = time.ticks_ms()
+    uart_poll_command()
+
+    # Origin and tolerance box.
+    img.draw_cross(ORIGIN_X, ORIGIN_Y, image.COLOR_BLUE, 2)
+    img.draw_rect(
+        ORIGIN_X - RESET_ERROR_LIMIT_PX,
+        ORIGIN_Y - RESET_ERROR_LIMIT_PX,
+        RESET_ERROR_LIMIT_PX * 2,
+        RESET_ERROR_LIMIT_PX * 2,
+        image.COLOR_BLUE
+    )
+
+    blobs = img.find_blobs(
+        [RED_LAB_THRESH],
+        pixels_threshold=MIN_SPOT_AREA,
+        area_threshold=MIN_SPOT_AREA,
+        merge=True
+    )
+    candidates = get_valid_spot_blobs(blobs)
+    active_step_label = None
+    if MODE == "calibrate" and calib_index < len(CALIB_STEPS):
+        active_step_label = CALIB_STEPS[calib_index][0]
+    target = select_target_blob(candidates, active_step_label)
+
     _touch_x, _touch_y, pressed = ts.read()
     touch_tap = pressed and not last_pressed
     last_pressed = pressed
 
-    if WORKFLOW == "a4_tape":
-        a4_frame_index += 1
-        if touch_tap:
-            reset_a4_run(now)
-            a4_run_active = True
-            a4_result_msg = "RUN"
+    if MODE == "calibrate" and touch_tap and target is None:
+        status_msg = "No laser spot"
 
-        draw_a4_rois(img)
+    has_spot = False
+    raw_x = 0.0
+    raw_y = 0.0
+    show_x = 0.0
+    show_y = 0.0
+    spot_x_cm = 0.0
+    spot_y_cm = 0.0
+    dist_origin = 999.0
 
-        if a4_frame_index % A4_DETECT_EVERY_FRAMES == 0:
-            found_a4 = detect_a4_target(img)
-            if found_a4 is not None:
-                if a4_target is None or found_a4["score"] >= a4_target["score"] * 0.88:
-                    a4_target = found_a4
-                a4_target_age = 0
-            else:
-                a4_target_age += 1
+    for b in candidates:
+        img.draw_rect(b.x(), b.y(), b.w(), b.h(), image.COLOR_YELLOW)
+
+    if target is not None:
+        raw_x = target.cx()
+        raw_y = target.cy()
+        has_spot = True
+
+        if view_x is None:
+            view_x = raw_x
+            view_y = raw_y
         else:
-            a4_target_age += 1
-
-        if a4_target_age > A4_HOLD_FRAMES:
-            a4_target = None
-
-        draw_a4_black_debug(img)
-
-        target, candidates = detect_red_spot(img)
-        for b in candidates:
-            img.draw_rect(b.x(), b.y(), b.w(), b.h(), image.COLOR_YELLOW)
-
-        has_spot = target is not None
-        spot_state = None
-        raw_x = 0.0
-        raw_y = 0.0
-        if has_spot:
-            raw_x = target.cx()
-            raw_y = target.cy()
-            img.draw_rect(target.x(), target.y(), target.w(), target.h(), image.COLOR_RED)
-            img.draw_cross(int(raw_x), int(raw_y), image.COLOR_RED, 2)
-            img.draw_circle(int(raw_x), int(raw_y), 5, image.COLOR_RED)
-
-        if a4_target is not None:
-            rect = a4_target["rect"]
-            draw_rect_lines(img, rect, image.COLOR_GREEN)
-            for p in rect:
-                img.draw_cross(int(p[0]), int(p[1]), image.COLOR_GREEN, 1)
-
-            if has_spot:
-                target = select_red_blob_for_a4(candidates, rect)
-                if target is not None:
-                    raw_x = target.cx()
-                    raw_y = target.cy()
-                    spot_state = tape_state_for_spot(rect, raw_x, raw_y)
-
-        if a4_run_active and spot_state is not None and has_spot:
-            on_tape, dist_tape_cm, progress, edge_idx, cm_per_px = spot_state
-
-            if a4_last_progress is not None:
-                delta = progress - a4_last_progress
-                if delta < -0.50:
-                    delta += 1.0
-                elif delta > 0.50:
-                    delta -= 1.0
-                if delta > A4_DIR_MIN_PROGRESS:
-                    a4_lap_progress += delta
-            a4_last_progress = progress
-
-            if on_tape:
-                a4_off_move_cm = 0.0
-            else:
-                if a4_last_spot is not None:
-                    a4_off_move_cm += point_distance_px((raw_x, raw_y), a4_last_spot) * cm_per_px
-                if a4_off_move_cm >= A4_FAIL_OFF_CM:
-                    a4_result_msg = "OFF >5cm"
-            a4_last_spot = (raw_x, raw_y)
-
-            elapsed_s = time.ticks_diff(now, a4_run_start_ms) / 1000.0
-            if a4_lap_progress >= 0.96 and elapsed_s <= 30.0:
-                a4_result_msg = "LAP OK"
-            elif elapsed_s > 30.0 and a4_lap_progress < 0.96:
-                a4_result_msg = "TIMEOUT"
-
-            if time.ticks_diff(now, a4_last_packet_ms) >= A4_PACKET_EVERY_MS:
-                a4_last_packet_ms = now
-                print("A4 x={:.1f} y={:.1f} on={} d={:.2f} edge={} prog={:.3f} lap={:.3f}".format(
-                    raw_x, raw_y, 1 if on_tape else 0, dist_tape_cm, edge_idx, progress, a4_lap_progress
-                ))
-
-        if a4_target is None:
-            img.draw_string(4, 4, "A4: NO TARGET", image.COLOR_RED)
-            if A4_DEBUG:
-                img.draw_string(4, 22, "B:{}/{} R:{} {}".format(
-                    a4_dbg_blob_pass, a4_dbg_blobs, a4_dbg_rects, a4_dbg_reason
-                ), image.COLOR_WHITE)
-            else:
-                img.draw_string(4, 22, "Need black tape border", image.COLOR_WHITE)
-        else:
-            img.draw_string(4, 4, "A4: FOUND {}".format(a4_target["source"]), image.COLOR_GREEN)
-            img.draw_string(4, 22, "S:{:.3f} asp:{:.2f}".format(
-                a4_target["cm_per_px"], a4_target["aspect"]
-            ), image.COLOR_WHITE)
-        if A4_DEBUG:
-            img.draw_string(4, 58, "black boxes: {}".format(len(a4_dbg_black_boxes)), image.COLOR_WHITE)
-
-        if not has_spot:
-            img.draw_string(4, 40, "Red: NO SPOT", image.COLOR_RED)
-        elif spot_state is None:
-            img.draw_string(4, 40, "Red: WAIT A4 ({:.0f},{:.0f})".format(raw_x, raw_y), image.COLOR_YELLOW)
-        else:
-            on_tape, dist_tape_cm, progress, edge_idx, cm_per_px = spot_state
-            color = image.COLOR_GREEN if on_tape else image.COLOR_RED
-            img.draw_string(4, 40, "Red:{} d:{:.2f}cm".format("ON" if on_tape else "OFF", dist_tape_cm), color)
-            img.draw_string(4, 58, "Edge:{} Prog:{:.2f}".format(edge_idx, progress), image.COLOR_WHITE)
-
-        if a4_run_active:
-            elapsed_s = time.ticks_diff(now, a4_run_start_ms) / 1000.0
-            img.draw_string(4, 76, "T:{:.1f}s Lap:{:.2f}".format(elapsed_s, a4_lap_progress), image.COLOR_WHITE)
-            img.draw_string(4, 94, "OffMove:{:.1f}cm {}".format(a4_off_move_cm, a4_result_msg), image.COLOR_YELLOW)
-        else:
-            img.draw_string(4, 76, "Tap screen to start", image.COLOR_WHITE)
-
-    else:
-        # Origin and tolerance box.
-        img.draw_cross(ORIGIN_X, ORIGIN_Y, image.COLOR_BLUE, 2)
-        img.draw_rect(
-            ORIGIN_X - RESET_ERROR_LIMIT_PX,
-            ORIGIN_Y - RESET_ERROR_LIMIT_PX,
-            RESET_ERROR_LIMIT_PX * 2,
-            RESET_ERROR_LIMIT_PX * 2,
-            image.COLOR_BLUE
-        )
-
-        active_step_label = None
-        if MODE == "calibrate" and calib_index < len(CALIB_STEPS):
-            active_step_label = CALIB_STEPS[calib_index][0]
-        target, candidates = detect_red_spot(img, active_step_label)
-
-        if MODE == "calibrate" and touch_tap and target is None:
-            status_msg = "No laser spot"
-
-        has_spot = False
-        raw_x = 0.0
-        raw_y = 0.0
-        show_x = 0.0
-        show_y = 0.0
-        spot_x_cm = 0.0
-        spot_y_cm = 0.0
-        dist_origin = 999.0
-
-        for b in candidates:
-            img.draw_rect(b.x(), b.y(), b.w(), b.h(), image.COLOR_YELLOW)
-
-        if target is not None:
-            raw_x = target.cx()
-            raw_y = target.cy()
-            has_spot = True
-
-            if view_x is None:
+            dx = raw_x - view_x
+            dy = raw_y - view_y
+            if dx * dx + dy * dy > 14 * 14:
                 view_x = raw_x
                 view_y = raw_y
             else:
-                dx = raw_x - view_x
-                dy = raw_y - view_y
-                if dx * dx + dy * dy > 14 * 14:
-                    view_x = raw_x
-                    view_y = raw_y
-                else:
-                    view_x += (raw_x - view_x) * 0.30
-                    view_y += (raw_y - view_y) * 0.30
+                view_x += (raw_x - view_x) * 0.30
+                view_y += (raw_y - view_y) * 0.30
 
-            show_x = view_x
-            show_y = view_y
-            spot_x_cm, spot_y_cm = pixel_to_cm(raw_x, raw_y)
-            dist_origin = distance_cm(spot_x_cm, spot_y_cm, 0.0, 0.0)
+        show_x = view_x
+        show_y = view_y
+        spot_x_cm, spot_y_cm = pixel_to_cm(raw_x, raw_y)
+        dist_origin = distance_cm(spot_x_cm, spot_y_cm, 0.0, 0.0)
 
-            img.draw_rect(target.x(), target.y(), target.w(), target.h(), image.COLOR_RED)
-            img.draw_cross(int(show_x), int(show_y), image.COLOR_RED, 2)
+        img.draw_rect(target.x(), target.y(), target.w(), target.h(), image.COLOR_RED)
+        img.draw_cross(int(show_x), int(show_y), image.COLOR_RED, 2)
 
-            if MODE == "calibrate" and touch_tap:
-                confirm_current_point(raw_x, raw_y)
+        if MODE == "calibrate" and touch_tap:
+            confirm_current_point(raw_x, raw_y)
 
-        else:
-            view_x = None
-            view_y = None
-            if MODE == "calibrate" and touch_tap:
-                status_msg = "No laser spot"
+    else:
+        view_x = None
+        view_y = None
+        if MODE == "calibrate" and touch_tap:
+            status_msg = "No laser spot"
 
-        if MODE == "calibrate":
-            if calib_index < len(CALIB_STEPS):
-                label, wx, wy = CALIB_STEPS[calib_index]
-                img.draw_string(4, 4, "CALIB  saved:{}/5".format(calib_index), image.COLOR_YELLOW)
-                img.draw_string(4, 22, "Step {}/5: {}".format(calib_index + 1, label), image.COLOR_YELLOW)
-                img.draw_string(4, 40, "Target: ({:.1f}, {:.1f})cm".format(wx, wy), image.COLOR_WHITE)
-                if has_spot:
-                    img.draw_string(4, 58, TOUCH_HINT, image.COLOR_WHITE)
-                    img.draw_string(4, 76, "X:{:.1f} Y:{:.1f}cm".format(spot_x_cm, spot_y_cm), image.COLOR_WHITE)
-                else:
-                    img.draw_string(4, 58, "Find the red spot", image.COLOR_RED)
-                if status_msg:
-                    img.draw_string(4, 94, status_msg, image.COLOR_GREEN)
-            else:
-                img.draw_string(4, 4, "Calibration done", image.COLOR_GREEN)
-                MODE = "track"
-
-        if MODE == "track":
-            if status_msg:
-                img.draw_string(4, 58, status_msg, image.COLOR_GREEN)
+    if MODE == "calibrate":
+        if calib_index < len(CALIB_STEPS):
+            label, wx, wy = CALIB_STEPS[calib_index]
+            img.draw_string(4, 4, "CALIB  saved:{}/5".format(calib_index), image.COLOR_YELLOW)
+            img.draw_string(4, 22, "Step {}/5: {}".format(calib_index + 1, label), image.COLOR_YELLOW)
+            img.draw_string(4, 40, "Target: ({:.1f}, {:.1f})cm".format(wx, wy), image.COLOR_WHITE)
             if has_spot:
-                img.draw_string(4, 4, "X:{:.1f} Y:{:.1f}cm".format(spot_x_cm, spot_y_cm), image.COLOR_WHITE)
-                img.draw_string(4, 22, "ERR:{:.2f}cm".format(dist_origin), image.COLOR_WHITE)
-                if dist_origin <= RESET_ERROR_LIMIT:
-                    img.draw_string(4, 40, "RESET OK", image.COLOR_GREEN)
-                else:
-                    img.draw_string(4, 40, "RESET FAIL", image.COLOR_RED)
+                img.draw_string(4, 58, TOUCH_HINT, image.COLOR_WHITE)
+                img.draw_string(4, 76, "X:{:.1f} Y:{:.1f}cm".format(spot_x_cm, spot_y_cm), image.COLOR_WHITE)
             else:
-                img.draw_string(4, 4, "Status: No Spot", image.COLOR_RED)
+                img.draw_string(4, 58, "Find the red spot", image.COLOR_RED)
+            if status_msg:
+                img.draw_string(4, 94, status_msg, image.COLOR_GREEN)
+        else:
+            img.draw_string(4, 4, "Calibration done", image.COLOR_GREEN)
+            MODE = "track"
+
+    if MODE == "track":
+        if status_msg:
+            img.draw_string(4, 58, status_msg, image.COLOR_GREEN)
+        if has_spot:
+            img.draw_string(4, 4, "X:{:.1f} Y:{:.1f}cm".format(spot_x_cm, spot_y_cm), image.COLOR_WHITE)
+            img.draw_string(4, 22, "ERR:{:.2f}cm".format(dist_origin), image.COLOR_WHITE)
+            if dist_origin <= RESET_ERROR_LIMIT:
+                img.draw_string(4, 40, "RESET OK", image.COLOR_GREEN)
+            else:
+                img.draw_string(4, 40, "RESET FAIL", image.COLOR_RED)
+        else:
+            img.draw_string(4, 4, "Status: No Spot", image.COLOR_RED)
+
+        if pending_reset_request or time.ticks_diff(now, last_live_send_ms) >= LIVE_SEND_INTERVAL_MS:
+            pending_reset_request = False
+            last_live_send_ms = now
+            send_live_point(raw_x, raw_y, has_spot)
 
     frame_cnt += 1
     if time.ticks_diff(now, last_tick) >= 1000:
@@ -1197,6 +526,6 @@ while True:
         frame_cnt = 0
         last_tick = now
 
-    img.draw_string(4, 112, "FPS:{} {}".format(fps, CAMERA_PROFILE), image.COLOR_WHITE)
+    img.draw_string(4, 112, "FPS:{} {} {}".format(fps, PROFILE, uart_status), image.COLOR_WHITE)
     disp.show(img)
     time.sleep_ms(1)

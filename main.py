@@ -71,12 +71,19 @@ A4_FAIL_OFF_CM = 5.0
 A4_MIN_RECT_AREA = 1800
 A4_MAX_RECT_AREA_RATIO = 0.86
 A4_MIN_EDGE_PX = 24
+A4_MIN_ASPECT_SCORE = 0.42
+A4_MIN_RECT_FILL = 0.04
+A4_MAX_RECT_FILL = 0.60
 A4_DETECT_EVERY_FRAMES = 3
 A4_HOLD_FRAMES = 18
 A4_PACKET_EVERY_MS = 300
 A4_DIR_MIN_PROGRESS = 0.004
 A4_RECT_THRESHOLD = 3500
 A4_DEBUG = True
+A4_SEARCH_ROIS = [
+    (0.10, 0.05, 0.78, 0.86),
+    (0.18, 0.10, 0.62, 0.72),
+]
 
 # Calibration workflow.
 MODE = "calibrate"  # "calibrate" or "track"
@@ -140,6 +147,7 @@ a4_dbg_blobs = 0
 a4_dbg_blob_pass = 0
 a4_dbg_rects = 0
 a4_dbg_reason = "INIT"
+a4_dbg_black_boxes = []
 
 
 def distance_cm(x1, y1, x2, y2):
@@ -419,6 +427,36 @@ def detect_red_spot(img, step_label=None):
     return select_target_blob(candidates, step_label), candidates
 
 
+def select_red_blob_for_a4(candidates, rect):
+    if not candidates:
+        return None
+
+    best_blob = None
+    best_score = -999999.0
+    buffer_px = 24
+    for b in candidates:
+        score = b.area()
+        if rect is not None:
+            inside = point_in_convex_quad(b.cx(), b.cy(), rect)
+            if inside:
+                score += 5000.0
+            else:
+                best_dist = 999999.0
+                for i in range(4):
+                    ax, ay = rect[i]
+                    bx, by = rect[(i + 1) % 4]
+                    dist, _ = point_segment_distance_px(b.cx(), b.cy(), ax, ay, bx, by)
+                    if dist < best_dist:
+                        best_dist = dist
+                if best_dist > buffer_px:
+                    continue
+                score += (buffer_px - best_dist) * 20.0
+        if score > best_score:
+            best_score = score
+            best_blob = b
+    return best_blob
+
+
 def blob_pixel_count(b):
     try:
         return b.pixels()
@@ -530,18 +568,7 @@ def detect_a4_target(img):
     a4_dbg_rects = 0
     a4_dbg_reason = "none"
 
-    try:
-        blobs = img.find_blobs(
-            [A4_BLACK_THRESH],
-            pixels_threshold=A4_BLACK_MIN_AREA,
-            area_threshold=A4_BLACK_MIN_AREA,
-            merge=True
-        )
-    except:
-        return None
-
-    if blobs is None:
-        blobs = []
+    blobs = find_a4_black_candidates(img)
 
     a4_dbg_blobs = len(blobs)
 
@@ -610,8 +637,15 @@ def score_a4_rect(rect):
     if abs(aspect - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
         return None
 
-    size_score = min(rect_area, 18000.0) / 18000.0
+    fill_ratio = rect_area / float(IMG_W * IMG_H)
+    if fill_ratio < A4_MIN_RECT_FILL or fill_ratio > A4_MAX_RECT_FILL:
+        return None
+
     aspect_score = max(0.0, 1.0 - abs(aspect - A4_ASPECT_PORTRAIT) * 2.5)
+    if aspect_score < A4_MIN_ASPECT_SCORE:
+        return None
+
+    size_score = min(rect_area, 18000.0) / 18000.0
     score = 180.0 + aspect_score * 120.0 + size_score * 40.0
 
     return {
@@ -624,6 +658,113 @@ def score_a4_rect(rect):
         "cm_per_px": cm_per_px_from_rect(rect),
         "source": "rect",
     }
+
+
+def rect_inside_roi(rect, roi):
+    if rect is None:
+        return False
+    rx, ry, rw, rh = roi
+    roi_x1 = rx * IMG_W
+    roi_y1 = ry * IMG_H
+    roi_x2 = (rx + rw) * IMG_W
+    roi_y2 = (ry + rh) * IMG_H
+    cx = 0.0
+    cy = 0.0
+    for x, y in rect:
+        cx += x
+        cy += y
+    cx /= 4.0
+    cy /= 4.0
+    return cx >= roi_x1 and cx <= roi_x2 and cy >= roi_y1 and cy <= roi_y2
+
+
+def blob_inside_any_roi(blob, rois):
+    if blob is None:
+        return False
+    try:
+        cx = float(blob.cx())
+        cy = float(blob.cy())
+    except:
+        try:
+            cx = float(blob.x()) + float(blob.w()) * 0.5
+            cy = float(blob.y()) + float(blob.h()) * 0.5
+        except:
+            return False
+
+    for roi in rois:
+        rx, ry, rw, rh = roi
+        roi_x1 = rx * IMG_W
+        roi_y1 = ry * IMG_H
+        roi_x2 = (rx + rw) * IMG_W
+        roi_y2 = (ry + rh) * IMG_H
+        if cx >= roi_x1 and cx <= roi_x2 and cy >= roi_y1 and cy <= roi_y2:
+            return True
+    return False
+
+
+def draw_blob_box(img, blob, color):
+    if blob is None:
+        return
+    try:
+        x = int(blob.x())
+        y = int(blob.y())
+        w = int(blob.w())
+        h = int(blob.h())
+        img.draw_rect(x, y, w, h, color)
+        img.draw_string(x, max(0, y - 12), "B{}".format(blob.pixels()), color)
+    except:
+        pass
+
+
+def draw_a4_black_debug(img):
+    for x, y, w, h, pixels in a4_dbg_black_boxes:
+        try:
+            img.draw_rect(int(x), int(y), int(w), int(h), image.COLOR_YELLOW)
+            img.draw_string(int(x), max(0, int(y) - 12), "B{}".format(int(pixels)), image.COLOR_YELLOW)
+        except:
+            pass
+
+
+def find_a4_black_candidates(img):
+    global a4_dbg_black_boxes
+
+    a4_dbg_black_boxes = []
+    blobs_all = []
+    seen = set()
+
+    for roi in A4_SEARCH_ROIS:
+        rx, ry, rw, rh = roi
+        roi_x = int(rx * IMG_W)
+        roi_y = int(ry * IMG_H)
+        roi_w = max(1, int(rw * IMG_W))
+        roi_h = max(1, int(rh * IMG_H))
+        try:
+            blobs = img.find_blobs(
+                [A4_BLACK_THRESH],
+                roi=(roi_x, roi_y, roi_w, roi_h),
+                pixels_threshold=A4_BLACK_MIN_AREA,
+                area_threshold=A4_BLACK_MIN_AREA,
+                merge=True
+            )
+        except:
+            blobs = []
+
+        if blobs is None:
+            continue
+
+        for b in blobs:
+            try:
+                key = (int(b.x()), int(b.y()), int(b.w()), int(b.h()))
+                pixels = blob_pixel_count(b)
+            except:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            blobs_all.append(b)
+            a4_dbg_black_boxes.append((key[0], key[1], key[2], key[3], pixels))
+
+    return blobs_all
 
 
 def detect_a4_rect_target(img):
@@ -641,13 +782,29 @@ def detect_a4_rect_target(img):
     best = None
     best_score = -999999.0
     for r in rects:
-        candidate = score_a4_rect(rect_corners_from_obj(r))
-        if candidate is None:
+        rect = rect_corners_from_obj(r)
+        if rect is None:
             continue
-        if candidate["score"] > best_score:
-            best_score = candidate["score"]
-            best = candidate
+        for roi in A4_SEARCH_ROIS:
+            if not rect_inside_roi(rect, roi):
+                continue
+            candidate = score_a4_rect(rect)
+            if candidate is None:
+                continue
+            if candidate["score"] > best_score:
+                best_score = candidate["score"]
+                best = candidate
+            break
     return best
+
+
+def draw_a4_rois(img):
+    for roi in A4_SEARCH_ROIS:
+        x = int(roi[0] * IMG_W)
+        y = int(roi[1] * IMG_H)
+        w = int(roi[2] * IMG_W)
+        h = int(roi[3] * IMG_H)
+        img.draw_rect(x, y, w, h, image.COLOR_BLUE)
 
 
 def draw_rect_lines(img, rect, color):
@@ -785,6 +942,8 @@ while True:
             a4_run_active = True
             a4_result_msg = "RUN"
 
+        draw_a4_rois(img)
+
         if a4_frame_index % A4_DETECT_EVERY_FRAMES == 0:
             found_a4 = detect_a4_target(img)
             if found_a4 is not None:
@@ -797,6 +956,8 @@ while True:
 
         if a4_target_age > A4_HOLD_FRAMES:
             a4_target = None
+
+        draw_a4_black_debug(img)
 
         target, candidates = detect_red_spot(img)
         for b in candidates:
@@ -820,7 +981,11 @@ while True:
                 img.draw_cross(int(p[0]), int(p[1]), image.COLOR_GREEN, 1)
 
             if has_spot:
-                spot_state = tape_state_for_spot(rect, raw_x, raw_y)
+                target = select_red_blob_for_a4(candidates, rect)
+                if target is not None:
+                    raw_x = target.cx()
+                    raw_y = target.cy()
+                    spot_state = tape_state_for_spot(rect, raw_x, raw_y)
 
         if a4_run_active and spot_state is not None and has_spot:
             on_tape, dist_tape_cm, progress, edge_idx, cm_per_px = spot_state
@@ -869,6 +1034,8 @@ while True:
             img.draw_string(4, 22, "S:{:.3f} asp:{:.2f}".format(
                 a4_target["cm_per_px"], a4_target["aspect"]
             ), image.COLOR_WHITE)
+        if A4_DEBUG:
+            img.draw_string(4, 58, "black boxes: {}".format(len(a4_dbg_black_boxes)), image.COLOR_WHITE)
 
         if not has_spot:
             img.draw_string(4, 40, "Red: NO SPOT", image.COLOR_RED)

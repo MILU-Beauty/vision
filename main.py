@@ -8,7 +8,7 @@ WORKFLOW = "a4_tape"  # "screen_reset" or "a4_tape"
 # Camera profiles.
 # Switch this line first when the venue light changes.
 if WORKFLOW == "a4_tape":
-    CAMERA_PROFILE = "a4_dark"
+    CAMERA_PROFILE = "a4_normal"
 else:
     CAMERA_PROFILE = "laser_dark"
 
@@ -41,9 +41,11 @@ RED_LAB_THRESHOLDS = {
     "laser_normal": (15, 255, 18, 127, -40, 90),
     "laser_bright": (30, 255, 25, 127, -30, 80),
     "a4_dark": (4, 255, 10, 127, -55, 105),
+    "a4_normal": (12, 255, 18, 127, -45, 95),
+    "a4_bright": (20, 255, 25, 127, -35, 85),
 }
 if WORKFLOW == "a4_tape":
-    RED_PROFILE = "a4_dark"
+    RED_PROFILE = CAMERA_PROFILE
 else:
     RED_PROFILE = "laser_dark"
 RED_LAB_THRESH = RED_LAB_THRESHOLDS.get(RED_PROFILE, RED_LAB_THRESHOLDS["laser_normal"])
@@ -57,32 +59,37 @@ MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 2.8
 
 # A4 black tape detection.
-A4_BLACK_THRESH = (0, 75, -35, 35, -35, 35)
-A4_BLACK_MIN_AREA = 80
-A4_BLACK_MAX_AREA = 50000
+A4_BLACK_THRESHOLDS = {
+    "a4_dark": (0, 75, -35, 35, -35, 35),
+    "a4_normal": (0, 58, -28, 28, -28, 28),
+    "a4_bright": (0, 48, -24, 24, -24, 24),
+}
+A4_BLACK_THRESH = A4_BLACK_THRESHOLDS.get(CAMERA_PROFILE, A4_BLACK_THRESHOLDS["a4_normal"])
+A4_BLACK_MIN_AREA = 220
+A4_BLACK_MAX_AREA = 45000
 A4_ASPECT_PORTRAIT = 21.0 / 29.7
 A4_ASPECT_LANDSCAPE = 29.7 / 21.0
 A4_ASPECT_TOL = 0.30
-A4_FILL_MIN = 0.02
-A4_FILL_MAX = 1.05
+A4_FILL_MIN = 0.05
+A4_FILL_MAX = 0.50
 A4_TAPE_WIDTH_CM = 1.8
 A4_TAPE_TOL_CM = 0.5
 A4_FAIL_OFF_CM = 5.0
-A4_MIN_RECT_AREA = 1800
-A4_MAX_RECT_AREA_RATIO = 0.86
-A4_MIN_EDGE_PX = 24
-A4_MIN_ASPECT_SCORE = 0.42
+A4_MIN_RECT_AREA = 2600
+A4_MAX_RECT_AREA_RATIO = 0.70
+A4_MIN_EDGE_PX = 32
+A4_MIN_ASPECT_SCORE = 0.50
 A4_MIN_RECT_FILL = 0.04
 A4_MAX_RECT_FILL = 0.60
 A4_DETECT_EVERY_FRAMES = 3
-A4_HOLD_FRAMES = 18
+A4_HOLD_FRAMES = 24
 A4_PACKET_EVERY_MS = 300
 A4_DIR_MIN_PROGRESS = 0.004
 A4_RECT_THRESHOLD = 3500
 A4_DEBUG = True
 A4_SEARCH_ROIS = [
-    (0.10, 0.05, 0.78, 0.86),
-    (0.18, 0.10, 0.62, 0.72),
+    (0.06, 0.04, 0.74, 0.82),
+    (0.12, 0.08, 0.64, 0.74),
 ]
 
 # Calibration workflow.
@@ -393,6 +400,29 @@ def get_valid_spot_blobs(blobs):
     return result
 
 
+def point_inside_any_roi(px, py, rois):
+    for roi in rois:
+        rx, ry, rw, rh = roi
+        x1 = rx * IMG_W
+        y1 = ry * IMG_H
+        x2 = (rx + rw) * IMG_W
+        y2 = (ry + rh) * IMG_H
+        if px >= x1 and px <= x2 and py >= y1 and py <= y2:
+            return True
+    return False
+
+
+def filter_blobs_in_rois(blobs, rois):
+    result = []
+    for b in blobs:
+        try:
+            if point_inside_any_roi(float(b.cx()), float(b.cy()), rois):
+                result.append(b)
+        except:
+            pass
+    return result
+
+
 def select_target_blob(candidates, step_label=None):
     best_blob = None
     best_score = -999999.0
@@ -424,6 +454,8 @@ def detect_red_spot(img, step_label=None):
         merge=True
     )
     candidates = get_valid_spot_blobs(blobs)
+    if WORKFLOW == "a4_tape":
+        candidates = filter_blobs_in_rois(candidates, A4_SEARCH_ROIS)
     return select_target_blob(candidates, step_label), candidates
 
 
@@ -758,6 +790,14 @@ def find_a4_black_candidates(img):
                 pixels = blob_pixel_count(b)
             except:
                 continue
+            if key[2] < A4_MIN_EDGE_PX or key[3] < A4_MIN_EDGE_PX:
+                continue
+            area_box = key[2] * key[3]
+            if area_box < A4_MIN_RECT_AREA:
+                continue
+            aspect_box = min(key[2], key[3]) / float(max(key[2], key[3]))
+            if abs(aspect_box - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
+                continue
             if key in seen:
                 continue
             seen.add(key)
@@ -947,7 +987,8 @@ while True:
         if a4_frame_index % A4_DETECT_EVERY_FRAMES == 0:
             found_a4 = detect_a4_target(img)
             if found_a4 is not None:
-                a4_target = found_a4
+                if a4_target is None or found_a4["score"] >= a4_target["score"] * 0.88:
+                    a4_target = found_a4
                 a4_target_age = 0
             else:
                 a4_target_age += 1

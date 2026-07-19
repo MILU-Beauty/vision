@@ -259,14 +259,14 @@ def save_calibration():
 
 
 def export_calibration_packet():
-    parts = []
-    for label, wx, wy in CALIB_STEPS:
+    lines = []
+    for idx, (label, wx, wy) in enumerate(CALIB_STEPS):
         if label in calib_points:
             px, py, _, _ = calib_points[label]
-            parts.append("{}={:.2f},{:.2f}".format(label, px, py))
+            lines.append("({},{},{})".format(idx, int(round(px)), int(round(py))))
     if H_MATRIX is not None:
-        parts.append("H=" + ",".join("{:.8f}".format(v) for v in H_MATRIX))
-    return "CALIB " + " ".join(parts)
+        lines.append("H=" + ",".join("{:.8f}".format(v) for v in H_MATRIX))
+    return "\n".join(lines)
 
 
 def capture_calibration_point(label, wx, wy, px, py):
@@ -282,7 +282,7 @@ def confirm_current_point(raw_x, raw_y):
     label, wx, wy = CALIB_STEPS[calib_index]
     capture_calibration_point(label, wx, wy, raw_x, raw_y)
     save_calibration()
-    print("Captured {}: {:.2f}, {:.2f}".format(label, raw_x, raw_y))
+    print("Captured ({},{},{})".format(calib_index, int(round(raw_x)), int(round(raw_y))))
 
     calib_index += 1
     status_msg = "Saved {}".format(label)

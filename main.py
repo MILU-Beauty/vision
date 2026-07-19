@@ -1,4 +1,4 @@
-from maix import camera, image, display, time, touchscreen
+from maix import camera, image, display, time, touchscreen, uart, pinmap
 import math
 
 # Camera profiles.
@@ -52,6 +52,16 @@ CALIB_STEPS = [
 ]
 TOUCH_HINT = "Tap screen to confirm current point"
 
+# UART link to motor controller.
+# MaixCam Pro recommended UART1: A19(TX) -> controller RX, A18(RX) <- controller TX, common GND.
+UART_ENABLED = True
+UART_PORT = "/dev/ttyS1"
+UART_BAUD = 115200
+UART_TX_PIN = "A19"
+UART_RX_PIN = "A18"
+LIVE_POINT_ID = 5
+LIVE_SEND_INTERVAL_MS = 80
+
 CALIB_EXPECTED_PIXEL = {
     "TL": (IMG_W * 0.25, IMG_H * 0.25),
     "TR": (IMG_W * 0.75, IMG_H * 0.25),
@@ -67,6 +77,11 @@ cam.exposure(profile["exposure"])
 cam.gain(profile["gain"])
 disp = display.Display()
 ts = touchscreen.TouchScreen()
+serial = None
+uart_rx_buf = ""
+uart_status = "UART OFF"
+last_live_send_ms = 0
+pending_reset_request = False
 try:
     DISP_W = disp.width()
     DISP_H = disp.height()
@@ -92,6 +107,75 @@ def distance_cm(x1, y1, x2, y2):
     dx = x1 - x2
     dy = y1 - y2
     return math.sqrt(dx * dx + dy * dy)
+
+
+def init_uart_link():
+    global serial, uart_status
+    if not UART_ENABLED:
+        uart_status = "UART DISABLED"
+        return False
+
+    try:
+        pinmap.set_pin_function(UART_TX_PIN, "UART1_TX")
+        pinmap.set_pin_function(UART_RX_PIN, "UART1_RX")
+    except:
+        pass
+
+    try:
+        serial = uart.UART(UART_PORT, UART_BAUD)
+        uart_status = "UART {} {}".format(UART_PORT, UART_BAUD)
+        return True
+    except:
+        serial = None
+        uart_status = "UART FAIL"
+        return False
+
+
+def uart_send_line(text):
+    global serial
+    line = "{}\n".format(text)
+    print(line.strip())
+    if serial is None:
+        return False
+    try:
+        if hasattr(serial, "write_str"):
+            serial.write_str(line)
+        else:
+            serial.write(line.encode())
+        return True
+    except:
+        return False
+
+
+def uart_send_point(idx, x, y):
+    return uart_send_line("({},{},{})".format(int(idx), int(x), int(y)))
+
+
+def uart_poll_command():
+    global uart_rx_buf, pending_reset_request
+    if serial is None:
+        return
+    try:
+        data = serial.read()
+    except:
+        return
+    if not data:
+        return
+    try:
+        if isinstance(data, bytes):
+            chunk = data.decode("utf-8", "ignore")
+        else:
+            chunk = str(data)
+    except:
+        return
+    uart_rx_buf += chunk
+    while "\n" in uart_rx_buf:
+        line, uart_rx_buf = uart_rx_buf.split("\n", 1)
+        cmd = line.strip().upper()
+        if not cmd:
+            continue
+        if cmd in ("R", "RESET", "START"):
+            pending_reset_request = True
 
 
 def solve_linear_system(a, b):
@@ -269,6 +353,13 @@ def export_calibration_packet():
     return "\n".join(lines)
 
 
+def send_calibration_packet():
+    packet = export_calibration_packet()
+    if packet:
+        for line in packet.split("\n"):
+            uart_send_line(line)
+
+
 def capture_calibration_point(label, wx, wy, px, py):
     calib_points[label] = (px, py, wx, wy)
 
@@ -293,19 +384,30 @@ def confirm_current_point(raw_x, raw_y):
         dst_pts = [(calib_points[label][2], calib_points[label][3]) for label in corner_labels]
         H_MATRIX = compute_homography(src_pts, dst_pts)
         save_calibration()
-        print(export_calibration_packet())
+        send_calibration_packet()
         MODE = "track"
         status_msg = "Calibration done"
+
+
+def send_live_point(raw_x, raw_y, has_spot):
+    if has_spot:
+        x_cm, y_cm = pixel_to_cm(raw_x, raw_y)
+        uart_send_point(LIVE_POINT_ID, int(round(x_cm)), int(round(y_cm)))
+    else:
+        uart_send_point(LIVE_POINT_ID, -1, -1)
 
 
 load_calibration()
 if MODE == "calibrate":
     calib_points = {}
     H_MATRIX = None
+init_uart_link()
 print("Vision ready, mode = {}".format(MODE))
 
 while True:
     img = cam.read()
+    now = time.ticks_ms()
+    uart_poll_command()
 
     # Origin and tolerance box.
     img.draw_cross(ORIGIN_X, ORIGIN_Y, image.COLOR_BLUE, 2)
@@ -413,13 +515,17 @@ while True:
         else:
             img.draw_string(4, 4, "Status: No Spot", image.COLOR_RED)
 
+        if pending_reset_request or time.ticks_diff(now, last_live_send_ms) >= LIVE_SEND_INTERVAL_MS:
+            pending_reset_request = False
+            last_live_send_ms = now
+            send_live_point(raw_x, raw_y, has_spot)
+
     frame_cnt += 1
-    now = time.ticks_ms()
     if time.ticks_diff(now, last_tick) >= 1000:
         fps = frame_cnt
         frame_cnt = 0
         last_tick = now
 
-    img.draw_string(4, 112, "FPS:{} {}".format(fps, PROFILE), image.COLOR_WHITE)
+    img.draw_string(4, 112, "FPS:{} {} {}".format(fps, PROFILE, uart_status), image.COLOR_WHITE)
     disp.show(img)
     time.sleep_ms(1)

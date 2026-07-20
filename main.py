@@ -9,7 +9,7 @@ WORKFLOW = "a4_tape"  # "screen_reset" or "a4_tape"
 # Camera profiles.
 # Switch this line first when the venue light changes.
 if WORKFLOW == "a4_tape":
-    CAMERA_PROFILE = "a4_normal"
+    CAMERA_PROFILE = "a4_dark"
 else:
     CAMERA_PROFILE = "laser_dark"
 
@@ -68,25 +68,36 @@ A4_BLACK_THRESHOLDS = {
 A4_BLACK_THRESH = A4_BLACK_THRESHOLDS.get(CAMERA_PROFILE, A4_BLACK_THRESHOLDS["a4_normal"])
 A4_BLACK_MIN_AREA = 220
 A4_BLACK_MAX_AREA = 45000
+A4_LOOSE_BLACK_MIN_AREA = 60
+A4_LOOSE_BLACK_MAX_AREA = 60000
 A4_ASPECT_PORTRAIT = 21.0 / 29.7
 A4_ASPECT_LANDSCAPE = 29.7 / 21.0
 A4_ASPECT_TOL = 0.30
+A4_LOOSE_ASPECT_TOL = 0.42
 A4_FILL_MIN = 0.05
 A4_FILL_MAX = 0.50
+A4_LOOSE_FILL_MIN = 0.02
+A4_LOOSE_FILL_MAX = 0.85
 A4_TAPE_WIDTH_CM = 1.8
 A4_TAPE_TOL_CM = 0.5
 A4_FAIL_OFF_CM = 5.0
 A4_MIN_RECT_AREA = 2600
+A4_LOOSE_MIN_RECT_AREA = 700
 A4_MAX_RECT_AREA_RATIO = 0.70
+A4_LOOSE_MAX_RECT_AREA_RATIO = 0.85
 A4_MIN_EDGE_PX = 32
+A4_LOOSE_MIN_EDGE_PX = 14
 A4_MIN_ASPECT_SCORE = 0.50
+A4_LOOSE_MIN_ASPECT_SCORE = 0.35
 A4_MIN_RECT_FILL = 0.04
 A4_MAX_RECT_FILL = 0.60
+A4_ENABLE_LOOSE_FALLBACK = False
 A4_DETECT_EVERY_FRAMES = 3
-A4_HOLD_FRAMES = 24
+A4_HOLD_FRAMES = 60
 A4_PACKET_EVERY_MS = 300
 A4_DIR_MIN_PROGRESS = 0.004
-A4_RECT_THRESHOLD = 3500
+A4_RECT_THRESHOLD = 2200
+A4_LOOSE_RECT_THRESHOLD = 1200
 A4_DEBUG = True
 A4_SEARCH_ROIS = [
     (0.06, 0.04, 0.74, 0.82),
@@ -618,11 +629,20 @@ def blob_rect_corners(b):
     ])
 
 
-def score_a4_blob(b):
+def score_a4_blob(b, loose=False):
     global a4_dbg_reason
 
+    min_area = A4_LOOSE_BLACK_MIN_AREA if loose else A4_BLACK_MIN_AREA
+    max_area = A4_LOOSE_BLACK_MAX_AREA if loose else A4_BLACK_MAX_AREA
+    min_rect_area = A4_LOOSE_MIN_RECT_AREA if loose else A4_MIN_RECT_AREA
+    max_rect_ratio = A4_LOOSE_MAX_RECT_AREA_RATIO if loose else A4_MAX_RECT_AREA_RATIO
+    min_edge_px = A4_LOOSE_MIN_EDGE_PX if loose else A4_MIN_EDGE_PX
+    aspect_tol = A4_LOOSE_ASPECT_TOL if loose else A4_ASPECT_TOL
+    fill_min = A4_LOOSE_FILL_MIN if loose else A4_FILL_MIN
+    fill_max = A4_LOOSE_FILL_MAX if loose else A4_FILL_MAX
+
     pixels = blob_pixel_count(b)
-    if pixels < A4_BLACK_MIN_AREA or pixels > A4_BLACK_MAX_AREA:
+    if pixels < min_area or pixels > max_area:
         a4_dbg_reason = "area {}".format(pixels)
         return None
 
@@ -632,10 +652,10 @@ def score_a4_blob(b):
         return None
 
     rect_area = polygon_area(rect)
-    if rect_area < A4_MIN_RECT_AREA:
+    if rect_area < min_rect_area:
         a4_dbg_reason = "rect {:.0f}".format(rect_area)
         return None
-    if rect_area > IMG_W * IMG_H * A4_MAX_RECT_AREA_RATIO:
+    if rect_area > IMG_W * IMG_H * max_rect_ratio:
         a4_dbg_reason = "big {:.0f}".format(rect_area)
         return None
 
@@ -646,17 +666,17 @@ def score_a4_blob(b):
 
     short_px = min(lengths)
     long_px = max(lengths)
-    if short_px < A4_MIN_EDGE_PX or long_px <= 1.0:
+    if short_px < min_edge_px or long_px <= 1.0:
         a4_dbg_reason = "edge {:.0f}".format(short_px)
         return None
 
     aspect = short_px / long_px
-    if abs(aspect - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
+    if abs(aspect - A4_ASPECT_PORTRAIT) > aspect_tol:
         a4_dbg_reason = "aspect {:.2f}".format(aspect)
         return None
 
     fill = pixels / rect_area
-    if fill < A4_FILL_MIN or fill > A4_FILL_MAX:
+    if fill < fill_min or fill > fill_max:
         a4_dbg_reason = "fill {:.2f}".format(fill)
         return None
 
@@ -673,11 +693,11 @@ def score_a4_blob(b):
         "fill": fill,
         "aspect": aspect,
         "cm_per_px": cm_per_px_from_rect(rect),
-        "source": "blob",
+        "source": "blob-far" if loose else "blob",
     }
 
 
-def detect_a4_target(img):
+def detect_a4_target_pass(img, loose=False):
     global a4_dbg_blobs, a4_dbg_blob_pass, a4_dbg_rects, a4_dbg_reason
 
     a4_dbg_blobs = 0
@@ -685,14 +705,14 @@ def detect_a4_target(img):
     a4_dbg_rects = 0
     a4_dbg_reason = "none"
 
-    blobs = find_a4_black_candidates(img)
+    blobs = find_a4_black_candidates(img, loose)
 
     a4_dbg_blobs = len(blobs)
 
     best = None
     best_score = -999999.0
     for b in blobs:
-        candidate = score_a4_blob(b)
+        candidate = score_a4_blob(b, loose)
         if candidate is None:
             continue
         a4_dbg_blob_pass += 1
@@ -700,7 +720,7 @@ def detect_a4_target(img):
             best_score = candidate["score"]
             best = candidate
 
-    rect_best = detect_a4_rect_target(img)
+    rect_best = detect_a4_rect_target(img, loose)
     if rect_best is not None:
         if best is None or rect_best["score"] > best["score"]:
             best = rect_best
@@ -708,6 +728,15 @@ def detect_a4_target(img):
     if best is not None:
         a4_dbg_reason = best["source"]
     return best
+
+
+def detect_a4_target(img):
+    best = detect_a4_target_pass(img, False)
+    if best is not None:
+        return best
+    if A4_ENABLE_LOOSE_FALLBACK:
+        return detect_a4_target_pass(img, True)
+    return None
 
 
 def rect_corners_from_obj(r):
@@ -731,14 +760,20 @@ def rect_corners_from_obj(r):
         return None
 
 
-def score_a4_rect(rect):
+def score_a4_rect(rect, loose=False):
     if rect is None:
         return None
 
+    min_rect_area = A4_LOOSE_MIN_RECT_AREA if loose else A4_MIN_RECT_AREA
+    max_rect_ratio = A4_LOOSE_MAX_RECT_AREA_RATIO if loose else A4_MAX_RECT_AREA_RATIO
+    min_edge_px = A4_LOOSE_MIN_EDGE_PX if loose else A4_MIN_EDGE_PX
+    aspect_tol = A4_LOOSE_ASPECT_TOL if loose else A4_ASPECT_TOL
+    min_aspect_score = A4_LOOSE_MIN_ASPECT_SCORE if loose else A4_MIN_ASPECT_SCORE
+
     rect_area = polygon_area(rect)
-    if rect_area < A4_MIN_RECT_AREA:
+    if rect_area < min_rect_area:
         return None
-    if rect_area > IMG_W * IMG_H * A4_MAX_RECT_AREA_RATIO:
+    if rect_area > IMG_W * IMG_H * max_rect_ratio:
         return None
 
     lengths = rect_edge_lengths(rect)
@@ -747,11 +782,11 @@ def score_a4_rect(rect):
 
     short_px = min(lengths)
     long_px = max(lengths)
-    if short_px < A4_MIN_EDGE_PX or long_px <= 1.0:
+    if short_px < min_edge_px or long_px <= 1.0:
         return None
 
     aspect = short_px / long_px
-    if abs(aspect - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
+    if abs(aspect - A4_ASPECT_PORTRAIT) > aspect_tol:
         return None
 
     fill_ratio = rect_area / float(IMG_W * IMG_H)
@@ -759,7 +794,7 @@ def score_a4_rect(rect):
         return None
 
     aspect_score = max(0.0, 1.0 - abs(aspect - A4_ASPECT_PORTRAIT) * 2.5)
-    if aspect_score < A4_MIN_ASPECT_SCORE:
+    if aspect_score < min_aspect_score:
         return None
 
     size_score = min(rect_area, 18000.0) / 18000.0
@@ -773,7 +808,7 @@ def score_a4_rect(rect):
         "fill": 0.0,
         "aspect": aspect,
         "cm_per_px": cm_per_px_from_rect(rect),
-        "source": "rect",
+        "source": "rect-far" if loose else "rect",
     }
 
 
@@ -793,6 +828,32 @@ def rect_inside_roi(rect, roi):
     cx /= 4.0
     cy /= 4.0
     return cx >= roi_x1 and cx <= roi_x2 and cy >= roi_y1 and cy <= roi_y2
+
+
+def rect_intersects_roi(rect, roi):
+    if rect is None:
+        return False
+    rx, ry, rw, rh = roi
+    roi_x1 = rx * IMG_W
+    roi_y1 = ry * IMG_H
+    roi_x2 = (rx + rw) * IMG_W
+    roi_y2 = (ry + rh) * IMG_H
+
+    min_x = rect[0][0]
+    max_x = rect[0][0]
+    min_y = rect[0][1]
+    max_y = rect[0][1]
+    for x, y in rect[1:]:
+        if x < min_x:
+            min_x = x
+        if x > max_x:
+            max_x = x
+        if y < min_y:
+            min_y = y
+        if y > max_y:
+            max_y = y
+
+    return not (max_x < roi_x1 or min_x > roi_x2 or max_y < roi_y1 or min_y > roi_y2)
 
 
 def blob_inside_any_roi(blob, rois):
@@ -842,8 +903,10 @@ def draw_a4_black_debug(img):
             pass
 
 
-def find_a4_black_candidates(img):
+def find_a4_black_candidates(img, loose=False):
     global a4_dbg_black_boxes
+
+    min_area = A4_LOOSE_BLACK_MIN_AREA if loose else A4_BLACK_MIN_AREA
 
     a4_dbg_black_boxes = []
     blobs_all = []
@@ -859,8 +922,8 @@ def find_a4_black_candidates(img):
             blobs = img.find_blobs(
                 [A4_BLACK_THRESH],
                 roi=(roi_x, roi_y, roi_w, roi_h),
-                pixels_threshold=A4_BLACK_MIN_AREA,
-                area_threshold=A4_BLACK_MIN_AREA,
+                pixels_threshold=min_area,
+                area_threshold=min_area,
                 merge=True
             )
         except:
@@ -875,13 +938,16 @@ def find_a4_black_candidates(img):
                 pixels = blob_pixel_count(b)
             except:
                 continue
-            if key[2] < A4_MIN_EDGE_PX or key[3] < A4_MIN_EDGE_PX:
+            min_edge_px = A4_LOOSE_MIN_EDGE_PX if loose else A4_MIN_EDGE_PX
+            min_rect_area = A4_LOOSE_MIN_RECT_AREA if loose else A4_MIN_RECT_AREA
+            aspect_tol = A4_LOOSE_ASPECT_TOL if loose else A4_ASPECT_TOL
+            if key[2] < min_edge_px or key[3] < min_edge_px:
                 continue
             area_box = key[2] * key[3]
-            if area_box < A4_MIN_RECT_AREA:
+            if area_box < min_rect_area:
                 continue
             aspect_box = min(key[2], key[3]) / float(max(key[2], key[3]))
-            if abs(aspect_box - A4_ASPECT_PORTRAIT) > A4_ASPECT_TOL:
+            if abs(aspect_box - A4_ASPECT_PORTRAIT) > aspect_tol:
                 continue
             if key in seen:
                 continue
@@ -892,11 +958,11 @@ def find_a4_black_candidates(img):
     return blobs_all
 
 
-def detect_a4_rect_target(img):
+def detect_a4_rect_target(img, loose=False):
     global a4_dbg_rects
 
     try:
-        rects = img.find_rects(threshold=A4_RECT_THRESHOLD)
+        rects = img.find_rects(threshold=A4_LOOSE_RECT_THRESHOLD if loose else A4_RECT_THRESHOLD)
     except:
         return None
 
@@ -911,9 +977,9 @@ def detect_a4_rect_target(img):
         if rect is None:
             continue
         for roi in A4_SEARCH_ROIS:
-            if not rect_inside_roi(rect, roi):
+            if not rect_intersects_roi(rect, roi):
                 continue
-            candidate = score_a4_rect(rect)
+            candidate = score_a4_rect(rect, loose)
             if candidate is None:
                 continue
             if candidate["score"] > best_score:
